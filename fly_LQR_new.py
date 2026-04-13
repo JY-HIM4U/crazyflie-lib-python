@@ -10,10 +10,16 @@ from collections import defaultdict
 import threading
 import csv
 
+# Add Stochastic_Hierarchies_Code to path (config, agents, world_map)
+# and Phoenix_smpc for phoenix_drone_simulation
+sys.path.insert(0, '/home/realm/jaeyoun/Phoenix_smpc/Stochastic_Hierarchies_Code')
+sys.path.insert(0, '/home/realm/jaeyoun/Phoenix_smpc')
+
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, List, Dict, Any
 import json
+import yaml
 import torch
 
 import cflib.crtp
@@ -27,9 +33,10 @@ from smpc import shrinking_horizon_SMPC, DAQP_fast, QP
 from quadcopter_dynamics import quadcopter_dynamics_single_step_linear
 from LQR import compute_lqt_gains, lqt_control_step
 # --------------------------------------------------
-from RL_smpc_rl_agent import RLAgent, simple_minmax_normalize
-from RL_smpc_world_map import WorldMap
-from RL_smpc_config import *
+from agent_cmdp import RLAgent, simple_minmax_normalize
+from agent_dcbf import DCBFRLAgent
+from world_map import WorldMap
+from config import *
 # Fix argv[0] in some embedded/REPL environments
 if not sys.argv:
     sys.argv = ['train_RL_smpc.py']
@@ -46,20 +53,39 @@ URIS = [
 disturbance_enabled = 1
 disturbance_strength = 0.3
 
-agent = RLAgent(state_dim=46, action_dim=2)
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_531.pth"  # Set your model path here
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_100_RLMPC_1e-2noise.pth"  # Set your model path here
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_326_RLMPC_1e-4_Final.pth"  # Set your model path here
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_270_RLMPC_Final_1e-4.pth"  # Set your model path here
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_280_RLMPC_Final_1e-4.pth"  # Set your model path here
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_300_RLMPC_1e-4.pth"  # Set your model path here
-MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_625_belief.pth"  # Set your model path here
+# Agent config matching config.yaml from training
+_AGENT_KWARGS = dict(
+    state_dim=49,
+    action_dim=2,
+    obs_dim=49,  # 44D base (17 state + 2 target + 25 grid) + 5D belief
+    use_residual_policy=True,
+    residual_zero_init=True,
+    residual_hidden_dim=32,
+    belief_dim=5,
+    residual_detach_base=True,
+    residual_mode="split_mean_uncertainty",
+)
+_DCBF_KWARGS = dict(
+    dcbf_alpha=0.05,
+    dcbf_eps=0.01,
+    dcbf_weight=1.0,
+    dcbf_gamma=0.8,
+    vh_use_belief=True,
+    policy_use_belief=True,
+    vh_residual_mode="gated",
+)
+MODEL_DIR = "/home/realm/jaeyoun/crazyflie-lib-python/models/trained_model_20260413_001419_ra_2_DCBF_belief_residual_seed1"
+MODEL_PATH = os.path.join(MODEL_DIR, "best.pth")
+MODEL_VH_PATH = os.path.join(MODEL_DIR, "best_vh.pth")
 
-
-
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_178_RLMPC_final_nodisturb.pth"  # Set your model path here
-
-# MODEL_PATH = "/home/realm/Jaeyoun/models/model_iter_600.pth"  # Set your model path here
+# Override WORLD_MAP_NAME from the model's training config
+with open(os.path.join(MODEL_DIR, "config.yaml"), "r") as _f:
+    _model_cfg = yaml.safe_load(_f)
+WORLD_MAP_NAME = _model_cfg["runtime_context"]["world_map_name"]
+ACTION_SCALE = _model_cfg["resolved_config"]["policy"]["action_scale"]
+WORLD_SIZE = _model_cfg["runtime_context"]["world_size"]
+TRAIN_START_XY = np.array(_model_cfg["runtime_context"]["start_position"][:2], dtype=np.float64)
+print(f"[config] Loaded from model config: WORLD_MAP_NAME={WORLD_MAP_NAME}, ACTION_SCALE={ACTION_SCALE}, WORLD_SIZE={WORLD_SIZE}, TRAIN_START_XY={TRAIN_START_XY}")
 
 DEFAULT_HEIGHT = 0.35          # 0.35 m (35 cm)
 VELOCITY = 0.1                 # m/s
@@ -83,6 +109,10 @@ fullstate: Dict[str, Dict[str, float]] = {}
 crazyflies: List[SyncCrazyflie] = []
 start_barrier = Barrier(len(URIS))
 
+# Set at runtime by test() so save_measurements_to_disk can overlay the map
+_flight_world_map = None       # WorldMap instance
+_flight_origin_offset = None   # np.ndarray [offset_x, offset_y]
+
 # =========================
 # Logging setup
 # =========================
@@ -97,69 +127,8 @@ def _sanitize_uri(uri: str) -> str:
     return uri.replace("://", "_").replace("/", "_").replace(":", "_")
 
 
-class DisturbanceKF2D:
-    """
-    Lightweight 2D disturbance estimator using a Kalman-style update.
-
-    State: d ~ N(mu, Sigma), mu in R^2, Sigma in R^{2x2}
-    Dynamics: d_{k+1} = d_k + w_k,     w_k ~ N(0, Q)
-    Measurement: r_k = d_k + v_k,      v_k ~ N(0, R)
-    """
-
-    def __init__(self, mu0=None, Sigma0=None, Q=None, R=None):
-        self.dim = 2
-        self._I = np.eye(self.dim, dtype=np.float64)
-        self.eps = 1e-8
-
-        if mu0 is None:
-            self.mu = np.zeros(self.dim, dtype=np.float64)
-        else:
-            self.mu = np.asarray(mu0, dtype=np.float64).reshape(self.dim)
-
-        if Sigma0 is None:
-            self.Sigma = (1e-4) * np.eye(self.dim, dtype=np.float64)
-        else:
-            self.Sigma = np.asarray(Sigma0, dtype=np.float64).reshape(self.dim, self.dim)
-
-        if Q is None:
-            self.Q = (1e-5) * np.eye(self.dim, dtype=np.float64)
-        else:
-            self.Q = np.asarray(Q, dtype=np.float64).reshape(self.dim, self.dim)
-
-        if R is None:
-            self.R = (1e-4) * np.eye(self.dim, dtype=np.float64)
-        else:
-            self.R = np.asarray(R, dtype=np.float64).reshape(self.dim, self.dim)
-
-    def predict(self):
-        """Time update: Sigma <- Sigma + Q (mu unchanged)."""
-        self.Sigma = self.Sigma + self.Q
-
-    def update(self, r):
-        """
-        Measurement update with residual r (2D).
-
-        K = Sigma (Sigma + R)^{-1}
-        mu <- mu + K (r - mu)
-        Sigma <- (I - K) Sigma
-        """
-        r = np.asarray(r, dtype=np.float64).reshape(self.dim)
-        try:
-            S = self.Sigma + self.R + self.eps * self._I
-            S_inv = np.linalg.inv(S)
-            K = self.Sigma @ S_inv
-            innovation = r - self.mu
-            self.mu = self.mu + K @ innovation
-            self.Sigma = (self._I - K) @ self.Sigma
-            if not np.all(np.isfinite(self.mu)) or not np.all(np.isfinite(self.Sigma)):
-                raise FloatingPointError("Non-finite Kalman state")
-        except (np.linalg.LinAlgError, FloatingPointError):
-            # If inversion or update fails, keep previous state and slightly inflate covariance
-            self.Sigma = self.Sigma + self.eps * self._I
-
-    def get_mu(self):
-        """Return current mean estimate as float32 vector."""
-        return self.mu.astype(np.float32)
+# Use the IMM belief filter from the training codebase (produces 5D features)
+from hierarchical_lqr.belief import DisturbanceIMM2D as DisturbanceKF2D
 
 
 def record_sample(uri: str,
@@ -222,53 +191,190 @@ def save_measurements_to_disk():
             w.writerows(rows)
         print(f"[logger] Saved {len(rows)} samples to {csv_path}")
 
-    # 2) XY plots
-    # Single combined plot for all URIs
-    plt.figure(figsize=(6, 6))
-    made_any = False
+    # 2) Evaluation-style 4-subplot plot per URI
+    def _overlay_world_map(ax, wmap):
+        """Draw safe (green), obstacle (red), target (blue) regions from the world map."""
+        ws = wmap.world_size
+        h, w = wmap.safe_set.shape
+        rgba = np.zeros((h, w, 4), dtype=np.float32)
+        safe_mask = wmap.safe_set > 0.5
+        rgba[safe_mask] = [0.0, 0.8, 0.0, 0.25]
+        avoid_mask = wmap.avoid_set > 0.5
+        rgba[avoid_mask] = [0.8, 0.0, 0.0, 0.35]
+        target_mask = wmap.target_set > 0.5
+        rgba[target_mask] = [0.0, 0.0, 0.8, 0.35]
+        ax.imshow(rgba, extent=[0, ws, 0, ws], origin='lower', aspect='equal', zorder=0)
+        gc = wmap.goal_center
+        ax.plot(gc[0], gc[1], marker='*', color='blue', markersize=15, zorder=5, label='Goal')
+
+    wmap = _flight_world_map  # may be None if test() wasn't run
+
     for uri, rows in _measurements.items():
         if not rows:
             continue
-        xs = [r["x"] for r in rows]
-        ys = [r["y"] for r in rows]
-        plt.plot(xs, ys, label=uri)
-        made_any = True
 
-        # Also save per-URI XY
-        uri_fig = os.path.join(LOG_DIR, f"{current_datetime}_{_sanitize_uri(uri)}_xy.png")
-        fig2, ax2 = plt.subplots(figsize=(6, 6))
-        ax2.plot(xs, ys)
-        ax2.set_aspect("equal", adjustable="box")
-        ax2.set_xlabel("x [m]")
-        ax2.set_ylabel("y [m]")
-        ax2.set_title(f"XY Trajectory: {uri}")
-        fig2.savefig(uri_fig, dpi=200, bbox_inches="tight")
-        plt.close(fig2)
-        print(f"[logger] Saved XY plot to {uri_fig}")
+        # --- Extract per-sample data ---
+        xs = np.array([r["x"] for r in rows])
+        ys = np.array([r["y"] for r in rows])
+        flight_times = np.array([r.get("flight_time", i * 0.025) for i, r in enumerate(rows)])
+        actions_x = np.array([r.get("action_x", 0.0) for r in rows])
+        actions_y = np.array([r.get("action_y", 0.0) for r in rows])
+        base_ax = np.array([r.get("base_action_x", 0.0) for r in rows])
+        base_ay = np.array([r.get("base_action_y", 0.0) for r in rows])
+        res_ax = np.array([r.get("residual_action_x", 0.0) for r in rows])
+        res_ay = np.array([r.get("residual_action_y", 0.0) for r in rows])
+        belief_mx = np.array([r.get("Belief_x", 0.0) for r in rows])
+        belief_my = np.array([r.get("Belief_y", 0.0) for r in rows])
+        belief_sx = np.array([r.get("Belief_sigma_x", 0.0) for r in rows])
+        belief_sy = np.array([r.get("Belief_sigma_y", 0.0) for r in rows])
+        residual_x = np.array([r.get("residual_x", 0.0) for r in rows])
+        residual_y = np.array([r.get("residual_y", 0.0) for r in rows])
+        traj_x_end = np.array([r.get("trajectory_x_end", 0.0) for r in rows])
+        traj_y_end = np.array([r.get("trajectory_y_end", 0.0) for r in rows])
+        goal_x = rows[0].get("goal_x", 0.0)
+        goal_y = rows[0].get("goal_y", 0.0)
 
-    if made_any:
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.xlabel("x [m]")
-        plt.ylabel("y [m]")
-        plt.title("XY Trajectories (all)")
-        plt.legend()
-        combined_fig = os.path.join(LOG_DIR, f"{current_datetime}_all_xy.png")
-        plt.savefig(combined_fig, dpi=200, bbox_inches="tight")
+        # Subsample to RL decision steps (where action changes)
+        rl_indices = [0]
+        for i in range(1, len(actions_x)):
+            if actions_x[i] != actions_x[i-1] or actions_y[i] != actions_y[i-1]:
+                rl_indices.append(i)
+
+        # --- Create 4-subplot figure ---
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+            1, 4, figsize=(25, 6),
+            gridspec_kw={"width_ratios": [1.45, 1.0, 1.0, 0.95]},
+        )
+
+        # ====== Subplot 1: Trajectory with world map ======
+        if wmap is not None:
+            _overlay_world_map(ax1, wmap)
+
+        # Drone path
+        ax1.plot(xs, ys, 'b-', linewidth=3, alpha=0.6, label='Drone Path', zorder=10)
+        ax1.plot(xs[0], ys[0], 'go', markersize=12, label='Start', zorder=11)
+        ax1.plot(goal_x, goal_y, 'r*', markersize=20, label='Target', zorder=11)
+
+        # Reference trajectory (end points of planned trajectory at each RL step)
+        rl_traj_x = traj_x_end[rl_indices]
+        rl_traj_y = traj_y_end[rl_indices]
+        ax1.plot(rl_traj_x, rl_traj_y, color='red', linewidth=2.0, alpha=0.9,
+                 label='Reference Trajectory', zorder=8)
+        ax1.scatter(rl_traj_x, rl_traj_y, c='orange', s=15, alpha=1.0,
+                    marker='o', edgecolors='k', linewidths=0.3,
+                    label='Reference Step', zorder=9)
+
+        # Belief arrows (mu_x, mu_y) at RL decision points
+        rl_xs = xs[rl_indices]
+        rl_ys = ys[rl_indices]
+        rl_bmx = belief_mx[rl_indices]
+        rl_bmy = belief_my[rl_indices]
+        belief_arrow_scale = 10.0
+        ax1.quiver(rl_xs, rl_ys,
+                   belief_arrow_scale * rl_bmx, belief_arrow_scale * rl_bmy,
+                   angles='xy', scale_units='xy', scale=1.0,
+                   color='magenta', alpha=0.8, width=0.003,
+                   zorder=12, label='Belief (mu_x, mu_y)')
+
+        # Residual correction arrows at RL steps
+        rl_res_x = residual_x[rl_indices]
+        rl_res_y = residual_y[rl_indices]
+        res_scale = 5.0
+        ax1.quiver(rl_xs, rl_ys,
+                   res_scale * rl_res_x, res_scale * rl_res_y,
+                   angles='xy', scale_units='xy', scale=1.0,
+                   color='orange', alpha=0.7, width=0.003,
+                   zorder=11, label='Residual obs (scaled)')
+
+        # World map boundaries
+        if wmap is not None:
+            ws = wmap.world_size
+            for v in [0, ws]:
+                ax1.axhline(y=v, color='k', linestyle='--', alpha=0.5, linewidth=1)
+                ax1.axvline(x=v, color='k', linestyle='--', alpha=0.5, linewidth=1)
+            ax1.set_xlim(-0.1, ws + 0.1)
+            ax1.set_ylim(-0.1, ws + 0.1)
+
+        ax1.grid(True, alpha=0.2)
+        ax1.set_xlabel('X Position (m)')
+        ax1.set_ylabel('Y Position (m)')
+        ax1.set_title(f'Trajectory: {uri}')
+        ax1.set_aspect('equal')
+        ax1.legend(loc='upper left', fontsize=8, framealpha=0.9)
+
+        # ====== Subplot 2: Distance to target & actions over time ======
+        dist_to_goal = np.sqrt((xs - goal_x)**2 + (ys - goal_y)**2)
+        ax2_twin = ax2.twinx()
+        ax2.plot(flight_times, dist_to_goal, 'b-', linewidth=2, label='Distance to Target')
+        ax2_twin.plot(flight_times, actions_x, 'g--', alpha=0.7, label='Action vx')
+        ax2_twin.plot(flight_times, actions_y, 'm--', alpha=0.7, label='Action vy')
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Distance (m)', color='b')
+        ax2_twin.set_ylabel('Action', color='r')
+        ax2.set_title('Performance Metrics')
+        lines2 = ax2.get_lines() + ax2_twin.get_lines()
+        ax2.legend(lines2, [l.get_label() for l in lines2], loc='upper right', fontsize=8)
+
+        # ====== Subplot 3: Action decomposition ======
+        ax3.plot(flight_times, base_ax, color='tab:blue', linewidth=2.0, label='Base ax[0]')
+        ax3.plot(flight_times, base_ay, color='tab:blue', linewidth=2.0, linestyle='--', label='Base ax[1]')
+        ax3.plot(flight_times, res_ax, color='orange', linewidth=2.0, label='Residual ax[0]')
+        ax3.plot(flight_times, res_ay, color='orange', linewidth=2.0, linestyle='--', label='Residual ax[1]')
+        ax3.plot(flight_times, actions_x, color='red', linewidth=2.0, alpha=0.9, label='Final ax[0]')
+        ax3.plot(flight_times, actions_y, color='red', linewidth=2.0, linestyle='--', alpha=0.9, label='Final ax[1]')
+        ax3.axhline(y=0.0, color='k', linestyle=':', alpha=0.4, linewidth=1)
+        ax3.grid(True, alpha=0.25)
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylabel('Action Value')
+        ax3.set_title('Action Decomposition')
+        ax3.legend(loc='upper right', fontsize=8)
+
+        # ====== Subplot 4: Belief uncertainty ======
+        uncertainties = belief_sx + belief_sy
+        ax4.plot(flight_times, uncertainties, color='tab:purple', linewidth=2.0, label='sigma_x + sigma_y')
+        ax4.axhline(y=0.0, color='k', linestyle=':', alpha=0.4, linewidth=1)
+        ax4.set_xlabel('Time (s)')
+        ax4.set_ylabel('Uncertainty', color='tab:purple')
+        ax4.tick_params(axis='y', labelcolor='tab:purple')
+        ax4.set_title('Belief Uncertainty')
+        ax4.grid(True, alpha=0.25)
+        # Residual norm on right axis
+        ax4_twin = ax4.twinx()
+        res_norm = np.sqrt(residual_x**2 + residual_y**2)
+        ax4_twin.plot(flight_times, res_norm, color='tab:gray', linewidth=1.8,
+                      linestyle='--', label='||residual||')
+        ax4_twin.set_ylabel('Residual norm', color='tab:gray')
+        ax4_twin.tick_params(axis='y', labelcolor='tab:gray')
+        unc_lines = ax4.get_lines() + ax4_twin.get_lines()
+        ax4.legend(unc_lines, [l.get_label() for l in unc_lines], loc='upper right', fontsize=8)
+
+        plt.tight_layout()
+        plot_path = os.path.join(LOG_DIR, f"{current_datetime}_{_sanitize_uri(uri)}_trajectory.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"[logger] Saved combined XY plot to {combined_fig}")
+        print(f"[logger] Saved evaluation-style trajectory plot to {plot_path}")
 
-def load_model(agent:RLAgent, model_path: str):
-    """Load the trained model weights into the existing RLAgent"""
+def load_model(agent, model_path: str, vh_path: str | None = None):
+    """Load the trained model weights into the agent (RLAgent or DCBFRLAgent)."""
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    
+
     # Load the trained weights into the existing actor_critic
     state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
     agent.actor_critic.load_state_dict(state_dict)
-    
+
     print(f"🎯 Model architecture:")
     print(f"   - Policy network: {agent.actor_critic.pi}")
     print(f"   - Value network: {agent.actor_critic.v}")
+
+    # Load V^h weights for DCBF agents
+    if vh_path is not None and hasattr(agent, "load_state_dict_vh"):
+        if os.path.exists(vh_path):
+            vh_state = torch.load(vh_path, map_location='cpu', weights_only=False)
+            agent.load_state_dict_vh(vh_state)
+            print(f"   - V^h loaded from {vh_path}")
+        else:
+            print(f"   - V^h checkpoint not found at {vh_path} — V^h will use random init")
     
 
 def state_to_input(state17, target_position, world_map):
@@ -575,6 +681,18 @@ def smooth_send_hover(cf, start_setpoint, target_setpoint, duration):
         cf.commander.send_hover_setpoint(vx, vy, yawrate, z)
         time.sleep(0.025)
 
+def smooth_land(cf, current_height, duration=3.0):
+    """Smoothly descend from current_height to 0 and stop motors."""
+    steps = int(duration / 0.025)
+    for i in range(steps):
+        z = current_height * (1.0 - (i + 1) / steps)
+        cf.commander.send_hover_setpoint(0, 0, 0, max(z, 0.02))
+        time.sleep(0.025)
+    # Cut motors
+    cf.commander.send_stop_setpoint()
+    time.sleep(0.1)
+
+
 def test_SMPC(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
     repeats = REPEATS
     com_params, dp_params, mpc_params, sim_params = load_parameters()
@@ -634,17 +752,28 @@ def test(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
                               duration=0.0)
     current_setpoint = (0.0, 0.0, 0.0, 0.0)
 
-    agent= RLAgent(state_dim=46, action_dim=2)
-    load_model(agent, MODEL_PATH)
-    world_map = WorldMap(world_name=WORLD_MAP_NAME)
+    agent = DCBFRLAgent(**_AGENT_KWARGS, **_DCBF_KWARGS)
+    load_model(agent, MODEL_PATH, vh_path=MODEL_VH_PATH)
+    world_map = WorldMap(world_name=WORLD_MAP_NAME, world_size=WORLD_SIZE)
     goal_position = world_map.goal_center.copy()
 
-    sim = PhoenixSimulator(WORLD_MAP_NAME)
-    # plot_action_field(agent, world_map, goal_position, 0 , True, None,  True, sim) 
-    
+    # PhoenixSimulator removed — only needed for plot_action_field (commented out)
+
     target_setpoint = (0.0, 0.0, 0.0, DEFAULT_HEIGHT)
     smooth_send_hover(cf, current_setpoint, target_setpoint, 3.0)
 
+    # Capture real initial position and compute offset so that the RL agent
+    # sees the drone starting at the training start position (e.g. [0.2, 0.3]).
+    # offset = TRAIN_START_XY - real_initial_xy
+    # shifted_xy = real_xy + offset
+    initial_state, _ = get_state_SI(uri)
+    origin_offset_xy = TRAIN_START_XY - initial_state[0:2].astype(np.float64)
+    print(f"[origin] Real initial XY: {initial_state[0:2]}, offset: {origin_offset_xy}")
+
+    # Store for trajectory plotting with map overlay
+    global _flight_world_map, _flight_origin_offset
+    _flight_world_map = world_map
+    _flight_origin_offset = origin_offset_xy
 
     ### Start ####
     prev_action = np.zeros((4,), dtype=np.float32)
@@ -660,52 +789,57 @@ def test(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
     reference_mpc = None  # (9, J+1)
 
     # Continuous logging at 5Hz for a specified duration
-    FLIGHT_DURATION = 30.0  # seconds - adjust as needed
+    FLIGHT_DURATION = 10.0  # seconds - adjust as needed
     LOG_INTERVAL = 0.2      # 5Hz logging (1/5 = 0.2 seconds)
 
     start_time = time.time()
     last_action_time = -5.0
     last_mpc_time = -MPC_PLANNING_INTERVAL
     current_action = np.array([0.0, 0.0], dtype=np.float32)  # Initialize with zero action
+    base_action_np = np.zeros(2, dtype=np.float32)
+    residual_action_np = np.zeros(2, dtype=np.float32)
     current_state_value = 0.0
     trajectory = None  # Initialize trajectory
     step = 0
-    q_scale = 1e-5
-    r_scale = 1e-4
-    Q = q_scale * np.eye(2, dtype=np.float64)
-    R = r_scale * np.eye(2, dtype=np.float64)
-    belief_filter = DisturbanceKF2D(
-        mu0=np.zeros(2, dtype=np.float64),
-        Sigma0=(1e-4) * np.eye(2, dtype=np.float64),
-        Q=Q,
-        R=R,
-    )
-    belief_vec = belief_filter.get_mu()
+    belief_filter = DisturbanceKF2D()  # IMM filter with sensible defaults
+    belief_features = belief_filter.get_features()  # 5D: [mu_x, mu_y, sigma_x, sigma_y, p_fast]
     prev_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     switched_to_low_level = False
     send_command_time = time.time()
     residual_xy_accumulated = np.zeros(2, dtype=np.float64)  # accumulated over MPC steps; update belief at RL step
+    termination_cause = "timeout"  # default; overwritten if goal/collision/OOB
     while time.time() - start_time < FLIGHT_DURATION:
         loop_start_time = time.time()
         current_time = time.time() - start_time
         
         current_state, thrust = get_state_SI(uri)  # 13D: [x,y,z,qx,qy,qz,qw,vx,vy,vz,gyro_x,gyro_y,gyro_z]
-        print(f"Current state: {current_state}")
+        current_state[0:2] += origin_offset_xy.astype(np.float32)  # shift XY to training frame
+        print(f"Current state (shifted): {current_state}")
         assert current_state.shape == (13,), f"get_state_SI expected 13-dim state, got {current_state.shape}"
         current_state[2] = DEFAULT_HEIGHT
         prev_action = [thrust, current_state[-3], current_state[-2], current_state[-1]]
-        
+
+        # Check terminal conditions every iteration (target reached / collision / OOB)
+        pos_status = world_map.check_position_status(
+            np.array([current_state[0], current_state[1], current_state[2]])
+        )
+        if pos_status['terminate']:
+            termination_cause = pos_status['message']
+            print(f"[terminal] {pos_status['status']}: {pos_status['message']} at ({current_state[0]:.3f}, {current_state[1]:.3f})")
+            break
+
         # Generate new action only every RL_DECISION_INTERVAL seconds
         if current_time - last_action_time >= RL_DECISION_INTERVAL-0.1:
             # Update belief once per RL step with accumulated residual (model error over interval)
             if np.all(np.isfinite(residual_xy_accumulated)):
+                belief_filter.predict()
                 belief_filter.update(residual_xy_accumulated)
-                belief_vec = belief_filter.get_mu()
+                belief_features = belief_filter.get_features()  # 5D
             residual_xy_accumulated[:] = 0.0  # reset for next interval
 
             current_state_input = np.concatenate([current_state, prev_action], axis=0)
             current_state_input = state_to_input(current_state_input, goal_position, world_map)
-            augmented_obs = np.concatenate([current_state_input, belief_vec], axis=0).astype(np.float32)
+            augmented_obs = np.concatenate([current_state_input, belief_features], axis=0).astype(np.float32)
             if(disturbance_enabled):
                 current_state_input[0:2] += np.random.multivariate_normal(
                     np.zeros(2), 
@@ -714,12 +848,13 @@ def test(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
             with torch.no_grad():
                     normalized_state = simple_minmax_normalize(augmented_obs)
                     obs_tensor = torch.FloatTensor(normalized_state).unsqueeze(0)
-                    # Get the policy distribution and use the mean (most probable action)
-                    dist = agent.actor_critic.pi.dist(obs_tensor)
                     current_state_value = agent.actor_critic.v(obs_tensor).cpu().numpy().squeeze()
-                    current_action = dist.mean.cpu().numpy().squeeze().astype(np.float32)
-            
-            print(f"New action generated: {current_action} at time {current_time:.1f}s")
+                    # Get action decomposition (base + residual)
+                    base_action_np, residual_action_np, current_action = \
+                        agent.get_action_components_deterministic(augmented_obs)
+                    current_action = current_action.astype(np.float32)
+
+            print(f"New action generated: {current_action} (base={base_action_np}, res={residual_action_np}) at time {current_time:.1f}s")
             last_action_time = current_time
 
                 # Apply the current action
@@ -747,9 +882,7 @@ def test(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
             pos = trajectory[0:3, -1]
             vel = trajectory[3:6, -1]
             acc = (vel - prev_vel) / MPC_PLANNING_INTERVAL
-            
-            if(current_state[0] > 1.4 and current_state[1] < 0.2):
-                break
+
         # Run LQR step at MPC_PLANNING_INTERVAL and send manual setpoint (roll, pitch, yawrate, thrust %)
         # if trajectory is not None and K_seq is not None and (current_time - last_mpc_time) >= MPC_PLANNING_INTERVAL:
         if not switched_to_low_level:
@@ -796,8 +929,14 @@ def test(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
                 "trajectory_y_start": float(trajectory[1,0]),
                 "trajectory_x_end": float(trajectory[0,-1]),
                 "trajectory_y_end": float(trajectory[1,-1]),
-                "Belief_x": float(belief_vec[0]),
-                "Belief_y": float(belief_vec[1]),
+                "base_action_x": float(base_action_np[0]),
+                "base_action_y": float(base_action_np[1]),
+                "residual_action_x": float(residual_action_np[0]),
+                "residual_action_y": float(residual_action_np[1]),
+                "Belief_x": float(belief_features[0]),
+                "Belief_y": float(belief_features[1]),
+                "Belief_sigma_x": float(belief_features[2]),
+                "Belief_sigma_y": float(belief_features[3]),
                 "state_value": float(current_state_value),
                 "goal_x": float(goal_position[0]),
                 "goal_y": float(goal_position[1]),
@@ -827,18 +966,22 @@ def test(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
         print(f"Time sleep: {sleep_time:.3f}s")
         time.sleep(sleep_time)
         current_state, thrust = get_state_SI(uri)  # 13D state
+        current_state[0:2] += origin_offset_xy.astype(np.float32)  # shift XY to training frame
 
         state_13 = current_state
         state_9 = state_13_to_state_9(state_13)
         residual_xy_accumulated += np.asarray(state_9[0:2] - x_pred_next[0:2], dtype=np.float64).reshape(2)
         # if trajectory is not None:
-        #     print(f"Updated belief: {belief_vec}")
+        #     print(f"Updated belief: {belief_features}")
         #     print(f"Current State: {current_state[0:5]}")
         #     print(f"Velocity Command: {velocity_cmd[0:2]*ACTION_SCALE}")
         step += 1
         print(f"Step {step}, Flight time: {current_time:.3f}s, Action time: {current_time - last_action_time:.3f}s")
         prev_vel = velocity_cmd
 
+    print(f"[flight] Ended with cause: {termination_cause}")
+
+    # Switch back to high-level commander for smooth landing
     if switched_to_low_level:
         try:
             cf.param.set_value("commander.enHighLevel", 1)
@@ -848,6 +991,8 @@ def test(cf, uri: str, initial_system_state=np.zeros((9,), dtype=np.float32)):
     current_setpoint = (0.0, 0.0, 0.0, current_state[2])
     target_setpoint = (0.0, 0.0, 0.0, DEFAULT_HEIGHT)
     smooth_send_hover(cf, current_setpoint, target_setpoint, 1.0)
+    # Smooth descent to ground and motor stop
+    smooth_land(cf, DEFAULT_HEIGHT, duration=3.0)
 
 # =========================
 # Main
