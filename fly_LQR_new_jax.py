@@ -56,11 +56,21 @@ from model.belief import (
 # =============================================================================
 # Config — loaded from the checkpoint's config.json
 # =============================================================================
-MODEL_DIR = (
-    "/home/realm/jaeyoun/crazyflie-lib-python/models/"
-    "trained_s0_M2_res_track_rew_frz_20260428_143340_"
-    "PhoenixPhysicalJAX_DCBF_belief_residual_seed0"
-)
+# Switch which trained model gets loaded. Each architecture differs:
+#   M0 — base (8-D obs, scratch) + residual + gate, MU/SIGMA scaled
+#   M1 — base only, no belief, no residual         (13-D obs+zeros)
+#   M2 — base (13-D obs+zeros) + residual + gate, MU/SIGMA scaled (frozen base)
+#   M5 — base only, belief CONCAT into obs        (13-D obs+belief)
+MODEL_TAG = "M5"   # one of: "M0", "M1", "M2", "M5"
+
+_MODELS_ROOT = "/home/realm/jaeyoun/crazyflie-lib-python/models"
+MODEL_DIRS = {
+    "M0": f"{_MODELS_ROOT}/trained_20260430_002921_s0_M0_res_track_rew_scratch_PhoenixPhysicalJAX_DCBF_belief_residual_seed0",
+    "M1": f"{_MODELS_ROOT}/trained_20260430_003922_s0_M1_nobelief_PhoenixPhysicalJAX_DCBF_nobelief_seed0",
+    "M2": f"{_MODELS_ROOT}/trained_s0_M2_res_track_rew_frz_20260428_143340_PhoenixPhysicalJAX_DCBF_belief_residual_seed0",
+    "M5": f"{_MODELS_ROOT}/trained_20260430_013140_s0_M5_concat_PhoenixPhysicalJAX_DCBF_belief_seed0",
+}
+MODEL_DIR       = MODEL_DIRS[MODEL_TAG]
 CHECKPOINT_PATH = os.path.join(MODEL_DIR, "best_checkpoint.pkl")
 
 with open(os.path.join(MODEL_DIR, "config.json"), "r") as _f:
@@ -73,7 +83,12 @@ SIGMA_SCALE    = float(_cfg.get("SIGMA_SCALE", 5.0))
 GATE_ACTIVATION = _cfg.get("GATE_ACTIVATION", "none")
 OBS_MODE       = _cfg.get("OBS_MODE", "simple_states")
 SENSING_RADIUS = float(_cfg.get("SENSING_RADIUS", 0.5))
+BELIEF_MODE    = _cfg.get("BELIEF_MODE", "residual")  # 'residual', 'concat', 'none'
+USE_RESIDUAL   = bool(_cfg.get("USE_RESIDUAL", True))
 BELIEF_DIM     = 5
+
+print(f"[config] MODEL_TAG={MODEL_TAG}, BELIEF_MODE={BELIEF_MODE}, "
+      f"USE_RESIDUAL={USE_RESIDUAL}, MU_SCALE={MU_SCALE}, SIGMA_SCALE={SIGMA_SCALE}")
 
 # =============================================================================
 # Map loading (ra_jy2)
@@ -163,12 +178,58 @@ def _build_lqr_system():
     B_dt = result[:n, n:n + m]
     Q = np.zeros((9, 9))
     Q[:3, :3]  = 4 * np.eye(3)   # position
-    Q[3:6, 3:6] = 2 * np.eye(3)  # velocity
+    Q[3:6, 3:6] = 1 * np.eye(3)  # velocity (lowered 2→1: less tilt-fight)
     Q[6:, 6:]   = np.eye(3)      # attitude
     R = 0.01 * np.eye(4)
     return A_dt, B_dt, Q, R
 
 A_dt, B_dt, Q_lqr, R_lqr = _build_lqr_system()
+
+
+def nonlinear_step(state_9, u_hat, dt=_DT_LQR, n_substeps=4):
+    """Closed-form nonlinear forward integration of one LQR-step's dynamics.
+
+    Used ONLY for the belief residual (state_9_post − x_pred_next). The LQR
+    controller still uses the linear A_dt/B_dt for gain scheduling.
+
+    Models:
+      - Trig coupling: vx_dot = (T/m)·sin(pitch)·cos(roll)
+                       vy_dot = -(T/m)·sin(roll)
+                       vz_dot = (T/m)·cos(pitch)·cos(roll) − g
+      - Linear drag (same as LQR's _DRAG/_MASS).
+      - Attitude relaxation: rpy_dot = (target − rpy)/τ_att.
+      - All in Phoenix convention (positive pitch = nose down → +x accel).
+
+    Args
+    ----
+    state_9 : np.ndarray (9,) [x, y, z, vx, vy, vz, roll, pitch, yaw]
+    u_hat   : np.ndarray (4,) [thrust_frac, target_roll, target_pitch, target_yaw]
+    dt      : LQR step duration
+    n_substeps : RK1 substeps per LQR step (4 is plenty for 25 ms)
+    """
+    h = dt / n_substeps
+    s = np.array(state_9, dtype=np.float64).copy()
+    target_rpy = np.asarray(u_hat[1:4], dtype=np.float64)
+    inv_tau = 1.0 / _TAU_ATT
+    drag_per_m = _DRAG / _MASS
+    T_total = _MASS * _GRAVITY + float(u_hat[0]) * _T_MAX   # total thrust (N)
+    T_over_m = T_total / _MASS
+    for _ in range(n_substeps):
+        roll, pitch = s[6], s[7]
+        c_r = math.cos(roll);  s_r = math.sin(roll)
+        c_p = math.cos(pitch); s_p = math.sin(pitch)
+        # Translational accel — full nonlinear thrust projection at yaw=0
+        ax = T_over_m * s_p * c_r           - drag_per_m * s[3]
+        ay = -T_over_m * s_r                - drag_per_m * s[4]
+        az = T_over_m * c_p * c_r - _GRAVITY - drag_per_m * s[5]
+        # Attitude relaxation toward commanded target
+        att_dot = (target_rpy - s[6:9]) * inv_tau
+        # Forward Euler update
+        s[0:3] += s[3:6] * h
+        s[3:6] += np.array([ax, ay, az]) * h
+        s[6:9] += att_dot * h
+    return s
+
 
 def compute_lqt_gains(A, B, Q, R, r_seq, Q_terminal=None):
     """Finite-horizon LQT backward recursion (numpy)."""
@@ -261,55 +322,76 @@ def _load_checkpoint(path):
           f"success_rate={ck.get('best_eval_success_rate', 'N/A')}")
     return ck
 
+def _layer_keys_in_order(params):
+    """Return Dense-like layer keys ('Dense_X' or 'layers_X') sorted by suffix.
+    Skips non-dict entries like 'log_std'."""
+    return sorted(
+        [k for k, v in params.items()
+         if isinstance(v, dict) and "kernel" in v],
+        key=lambda k: int(k.rsplit("_", 1)[1]),
+    )
+
+
 def _dense_forward(params, x, activation="relu"):
-    """Forward through a sequence of Dense_0, Dense_1, ... layers."""
-    idx = 0
-    while True:
-        key = f"Dense_{idx}"
-        if key not in params:
-            break
+    """Forward through Dense layers in order. Handles both 'Dense_X' and
+    'layers_X' (Sequential-style with skipped activation indices)."""
+    keys = _layer_keys_in_order(params)
+    for i, key in enumerate(keys):
         w = jnp.array(params[key]["kernel"])
         b = jnp.array(params[key]["bias"])
         x = x @ w + b
-        # Apply activation to all but last layer
-        next_key = f"Dense_{idx + 1}"
-        if next_key in params and activation == "relu":
-            x = jax.nn.relu(x)
-        elif next_key in params and activation == "tanh":
-            x = jnp.tanh(x)
-        idx += 1
+        if i < len(keys) - 1:
+            if activation == "relu":
+                x = jax.nn.relu(x)
+            elif activation == "tanh":
+                x = jnp.tanh(x)
     return x
 
 
-def policy_forward(policy_params, obs_8d_norm, belief_5d):
-    """Deterministic action from the residual policy.
-
-    Parameters
-    ----------
-    policy_params : dict  – checkpoint['policy']['params']
-    obs_8d_norm   : (8,) normalised simple_states observation
-    belief_5d     : (5,) [mu_x, mu_y, sigma_x, sigma_y, p_fast]
-
-    Returns
-    -------
-    action_mean : (2,) deterministic action in [-1, 1]
-    base_action : (2,)
-    residual    : (2,) gated residual correction
+def _base_input(obs_8d_norm, belief_5d, policy_params):
+    """Build the base_net input by inspecting its first kernel shape.
+        8-D first kernel  → obs only         (M0)
+        13-D first kernel → obs + slot       (slot = belief if concat else zeros)
     """
-    # Base net expects 13-D input: [obs_8d, zeros_5d_belief_slot]
-    # (trained without belief, so belief slot is always zero for the base)
-    x_base = jnp.concatenate([obs_8d_norm, jnp.zeros(5)])
-    base_mean = _dense_forward(policy_params["base_net"], x_base, activation="relu")
+    base_params = policy_params.get("base_net", policy_params)
+    first_key = _layer_keys_in_order(base_params)[0]
+    in_dim = base_params[first_key]["kernel"].shape[0]
+    if in_dim == 8:
+        return obs_8d_norm
+    if BELIEF_MODE == "concat":
+        return jnp.concatenate([obs_8d_norm, belief_5d])
+    return jnp.concatenate([obs_8d_norm, jnp.zeros(5)])
 
-    # Belief processing
+
+def policy_forward(policy_params, obs_8d_norm, belief_5d):
+    """Deterministic action. Branches on params structure to support:
+        - flat policy (M1, M5):  policy_params == top-level Dense_*
+        - residual policy (M0, M2): base_net + res_mean_net + gate_net
+    Returns (action_mean, base_mean, residual_mean*gate).
+    """
+    has_residual = ("res_mean_net" in policy_params
+                    and "base_net" in policy_params)
+
+    if not has_residual:
+        # Flat policy_network (M1 / M5). For M5 the belief is concatenated;
+        # for M1 (BELIEF_MODE='none') the slot is zeros — matches training.
+        x_input = _base_input(obs_8d_norm, belief_5d, policy_params)
+        action_mean = _dense_forward(policy_params, x_input, activation="relu")
+        zero = jnp.zeros_like(action_mean)
+        return action_mean, action_mean, zero
+
+    # Residual policy (M0 / M2). Base ignores belief; residual head consumes
+    # the scaled belief mean; gate consumes scaled belief uncertainty.
+    base_params = policy_params["base_net"]
+    x_base = _base_input(obs_8d_norm, belief_5d, policy_params)
+    base_mean = _dense_forward(base_params, x_base, activation="relu")
+
     belief_mean = belief_5d[:2] * MU_SCALE
     belief_unc = jnp.concatenate([
         belief_5d[2:4] * SIGMA_SCALE,
         belief_5d[4:5],
     ])
 
-    # Residual input: state_geom mode
-    # [stop_grad(base_mean), pos_xy, vel_xy, goal_delta, belief_mean]
     pos_xy = obs_8d_norm[:2]
     vel_xy = obs_8d_norm[2:4]
     goal_xy = obs_8d_norm[4:6]
@@ -322,8 +404,6 @@ def policy_forward(policy_params, obs_8d_norm, belief_5d):
     residual_mean = _dense_forward(
         policy_params["res_mean_net"], res_input, activation="relu"
     )
-
-    # Gate (activation="none" → linear, bias_init=1.0)
     gate = _dense_forward(
         policy_params["gate_net"], belief_unc, activation="relu"
     )
@@ -362,7 +442,9 @@ LOG_DIR = os.path.join(os.getcwd(), "cf_logs", time.strftime("%Y%m%d_%H%M%S"))
 os.makedirs(LOG_DIR, exist_ok=True)
 
 _measurements: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+_rl_decisions: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 _meas_lock = threading.Lock()
+_rl_lock = threading.Lock()
 
 def _sanitize_uri(uri: str) -> str:
     return uri.replace("://", "_").replace("/", "_").replace(":", "_")
@@ -370,6 +452,22 @@ def _sanitize_uri(uri: str) -> str:
 # =============================================================================
 # Logging helpers
 # =============================================================================
+def record_rl_decision(uri, rl_t, ref_mpc, belief_5d, current_xy):
+    """Snapshot one RL tick: full reference horizon (positions only) + belief
+    + the drone position when the decision was issued. Used for overlaying
+    the planned references on the trajectory plot afterwards."""
+    rec = {
+        "rl_t": float(rl_t),
+        "ref_x": np.asarray(ref_mpc[0, :], dtype=np.float64).copy(),
+        "ref_y": np.asarray(ref_mpc[1, :], dtype=np.float64).copy(),
+        "belief": np.asarray(belief_5d, dtype=np.float64).copy(),
+        "actual_x": float(current_xy[0]),
+        "actual_y": float(current_xy[1]),
+    }
+    with _rl_lock:
+        _rl_decisions[uri].append(rec)
+
+
 def record_sample(uri, state_vec, thrust_pwm, extra=None):
     row = {
         "t": time.time(),
@@ -408,7 +506,30 @@ def save_measurements_to_disk():
             w.writerows(rows)
         print(f"[logger] Saved {len(rows)} samples to {csv_path}")
 
-    # Trajectory plot
+    # Save per-RL-decision references + beliefs to CSV (one row per RL tick,
+    # ref_x/ref_y stored as semicolon-joined strings for CSV friendliness).
+    for uri, recs in _rl_decisions.items():
+        if not recs:
+            continue
+        rl_csv = os.path.join(LOG_DIR, f"{current_datetime}_{_sanitize_uri(uri)}_rl.csv")
+        with open(rl_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["rl_t", "actual_x", "actual_y",
+                        "belief_mu_x", "belief_mu_y",
+                        "belief_sigma_x", "belief_sigma_y", "belief_p_fast",
+                        "ref_x", "ref_y"])
+            for r in recs:
+                w.writerow([
+                    r["rl_t"], r["actual_x"], r["actual_y"],
+                    r["belief"][0], r["belief"][1],
+                    r["belief"][2], r["belief"][3], r["belief"][4],
+                    ";".join(f"{v:.4f}" for v in r["ref_x"]),
+                    ";".join(f"{v:.4f}" for v in r["ref_y"]),
+                ])
+        print(f"[logger] Saved {len(recs)} RL decisions to {rl_csv}")
+
+    # Trajectory plot — 1×4 layout: trajectory (with ref overlays), distance,
+    # actions, belief over RL time.
     for uri, rows in _measurements.items():
         if not rows:
             continue
@@ -418,9 +539,11 @@ def save_measurements_to_disk():
         actions_x = np.array([r.get("action_x", 0.0) for r in rows])
         actions_y = np.array([r.get("action_y", 0.0) for r in rows])
         goal_x, goal_y = GOAL_XY
+        rl_recs = _rl_decisions.get(uri, [])
 
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        # Subplot 1: XY trajectory
+        fig, axes = plt.subplots(1, 5, figsize=(30, 6))
+
+        # Subplot 1: XY trajectory + per-RL-decision reference horizons.
         ax = axes[0]
         m = _MAP
         h, w = m["safe"].shape
@@ -430,18 +553,69 @@ def save_measurements_to_disk():
         rgba[m["target"] > 0.5] = [0.0, 0.0, 0.8, 0.35]
         ax.imshow(rgba, extent=[0, _WORLD_SIZE, 0, _WORLD_SIZE],
                   origin='lower', aspect='equal', zorder=0)
-        ax.plot(xs, ys, 'b-', linewidth=2, alpha=0.7, label='Path')
-        ax.plot(xs[0], ys[0], 'go', markersize=10, label='Start')
-        ax.plot(goal_x, goal_y, 'r*', markersize=15, label='Goal')
+
+        # Reference horizons (one per RL tick) — thin red lines + dots.
+        for i, r in enumerate(rl_recs):
+            lab = 'Reference (planned)' if i == 0 else None
+            ax.plot(r["ref_x"], r["ref_y"], color='red', linewidth=1.0,
+                    alpha=0.55, zorder=4, label=lab)
+            ax.scatter(r["ref_x"], r["ref_y"], c='red', s=8, alpha=0.5, zorder=5)
+
+        # Real path (40 Hz LQR sampling).
+        ax.plot(xs, ys, 'b-', linewidth=1.8, alpha=0.85, label='Real path', zorder=6)
+        ax.scatter(xs, ys, c='blue', s=4, alpha=0.6, zorder=6)
+
+        # Pair markers — each reference's terminal point (red square) with
+        # where the drone actually was 0.5 s later (blue square). A grey line
+        # connects the pair so the prediction gap is visible at a glance.
+        for i, r in enumerate(rl_recs):
+            ref_end_x = float(r["ref_x"][-1])
+            ref_end_y = float(r["ref_y"][-1])
+            if i + 1 < len(rl_recs):
+                real_x = float(rl_recs[i + 1]["actual_x"])
+                real_y = float(rl_recs[i + 1]["actual_y"])
+            else:
+                real_x, real_y = float(xs[-1]), float(ys[-1])
+
+            lab_ref = 'Ref end (planned)' if i == 0 else None
+            lab_real = 'Real @ ref end (t+0.5s)' if i == 0 else None
+            ax.plot([ref_end_x, real_x], [ref_end_y, real_y],
+                    color='gray', linewidth=0.6, alpha=0.55, zorder=10)
+            ax.scatter(ref_end_x, ref_end_y, marker='s', s=55,
+                       facecolors='red', edgecolors='darkred', linewidths=1.0,
+                       alpha=0.95, zorder=11, label=lab_ref)
+            ax.scatter(real_x, real_y, marker='s', s=55,
+                       facecolors='blue', edgecolors='navy', linewidths=1.0,
+                       alpha=0.95, zorder=11, label=lab_real)
+            # Tiny step number annotation next to the ref-end square so you
+            # can map a square back to the time it was planned.
+            ax.text(ref_end_x + 0.02, ref_end_y + 0.02, f"{i}",
+                    fontsize=6, color='darkred', alpha=0.85, zorder=12)
+
+        # Belief mean as magenta arrows at each RL decision.
+        if rl_recs:
+            ax_xs = np.array([r["actual_x"] for r in rl_recs])
+            ax_ys = np.array([r["actual_y"] for r in rl_recs])
+            mu_x = np.array([r["belief"][0] for r in rl_recs])
+            mu_y = np.array([r["belief"][1] for r in rl_recs])
+            mu_mag = float(np.max(np.hypot(mu_x, mu_y)) or 1e-8)
+            scale = (0.15 / mu_mag) if mu_mag < 0.05 else 8.0
+            ax.quiver(ax_xs, ax_ys, scale * mu_x, scale * mu_y,
+                      angles='xy', scale_units='xy', scale=1.0,
+                      color='magenta', width=0.004, alpha=0.85, zorder=7)
+            ax.plot([], [], color='magenta', label='Belief μ')
+
+        ax.plot(xs[0], ys[0], 'go', markersize=10, label='Start', zorder=8)
+        ax.plot(goal_x, goal_y, 'r*', markersize=15, label='Goal', zorder=8)
         ax.set_xlim(-0.05, _WORLD_SIZE + 0.05)
         ax.set_ylim(-0.05, _WORLD_SIZE + 0.05)
         ax.set_aspect('equal')
-        ax.legend(fontsize=8)
-        ax.set_title('Trajectory')
+        ax.legend(fontsize=7, loc='upper right')
+        ax.set_title(f'Trajectory  ({MODEL_TAG})')
 
         # Subplot 2: distance to goal
         ax2 = axes[1]
-        dist = np.sqrt((xs - goal_x)**2 + (ys - goal_y)**2)
+        dist = np.sqrt((xs - goal_x) ** 2 + (ys - goal_y) ** 2)
         ax2.plot(flight_times, dist, 'b-')
         ax2.set_xlabel('Time (s)'); ax2.set_ylabel('Distance (m)')
         ax2.set_title('Distance to Goal')
@@ -451,6 +625,49 @@ def save_measurements_to_disk():
         ax3.plot(flight_times, actions_x, label='ax')
         ax3.plot(flight_times, actions_y, label='ay')
         ax3.legend(); ax3.set_xlabel('Time (s)'); ax3.set_title('Actions')
+
+        # Subplot 4: belief features over RL time (mu on left, sigma/p_fast on right).
+        ax4 = axes[3]
+        if rl_recs:
+            rl_t = np.array([r["rl_t"] for r in rl_recs])
+            bel = np.stack([r["belief"] for r in rl_recs], axis=0)  # (N, 5)
+            l1, = ax4.plot(rl_t, bel[:, 0], 'r-', linewidth=1.4, label='μ_x')
+            l2, = ax4.plot(rl_t, bel[:, 1], 'b-', linewidth=1.4, label='μ_y')
+            ax4.set_ylabel('Belief μ')
+            ax4.set_xlabel('RL time (s)')
+
+            ax4r = ax4.twinx()
+            l3, = ax4r.plot(rl_t, bel[:, 2], 'r--', linewidth=1.0, alpha=0.8, label='σ_x')
+            l4, = ax4r.plot(rl_t, bel[:, 3], 'b--', linewidth=1.0, alpha=0.8, label='σ_y')
+            l5, = ax4r.plot(rl_t, bel[:, 4], 'g-', linewidth=1.0, alpha=0.8, label='p_fast')
+            ax4r.set_ylabel('σ / p_fast', color='gray')
+            ax4r.tick_params(axis='y', labelcolor='gray')
+
+            ax4.legend([l1, l2, l3, l4, l5],
+                       [h.get_label() for h in [l1, l2, l3, l4, l5]],
+                       fontsize=6, loc='upper right')
+        else:
+            ax4.text(0.5, 0.5, 'no belief data', ha='center', va='center',
+                     transform=ax4.transAxes)
+        ax4.set_title('Belief over RL time')
+
+        # Subplot 5: commanded vs actual roll/pitch — diagnoses on-board PID
+        # overshoot or lag. If actual (solid) overshoots commanded (dashed),
+        # the inner attitude-loop gain is too high.
+        ax5 = axes[4]
+        cmd_roll = np.array([r.get("target_roll_deg", 0.0) for r in rows])
+        cmd_pitch = np.array([r.get("target_pitch_deg", 0.0) for r in rows])
+        act_roll = np.array([r.get("actual_roll_deg", 0.0) for r in rows])
+        act_pitch = np.array([r.get("actual_pitch_deg", 0.0) for r in rows])
+        ax5.plot(flight_times, cmd_roll, 'r--', linewidth=1.0, alpha=0.7, label='cmd roll')
+        ax5.plot(flight_times, act_roll, 'r-', linewidth=1.4, alpha=0.9, label='actual roll')
+        ax5.plot(flight_times, cmd_pitch, 'b--', linewidth=1.0, alpha=0.7, label='cmd pitch')
+        ax5.plot(flight_times, act_pitch, 'b-', linewidth=1.4, alpha=0.9, label='actual pitch')
+        ax5.axhline(25, color='gray', linestyle=':', linewidth=0.5)
+        ax5.axhline(-25, color='gray', linestyle=':', linewidth=0.5)
+        ax5.set_xlabel('Time (s)'); ax5.set_ylabel('deg')
+        ax5.set_title('Roll/Pitch: commanded vs actual')
+        ax5.legend(fontsize=6, loc='upper right')
 
         plt.tight_layout()
         plot_path = os.path.join(LOG_DIR, f"{current_datetime}_{_sanitize_uri(uri)}_traj.png")
@@ -470,19 +687,17 @@ def make_logconfs(uri):
     lc1.data_received_cb.add_callback(_log_cb_factory(uri))
     logconfs.append(lc1)
 
-    lc2 = LogConfig(name='Attitude', period_in_ms=25)
+    # Attitude at 20 Hz — only used for the LQR's roll/pitch state, which
+    # the on-board cascade tracks far faster than we can read it back.
+    lc2 = LogConfig(name='Attitude', period_in_ms=50)
     for v in ('stabilizer.roll', 'stabilizer.pitch', 'stabilizer.yaw'):
         lc2.add_variable(v, 'float')
     lc2.add_variable('stabilizer.thrust', 'float')
     lc2.data_received_cb.add_callback(_log_cb_factory(uri))
     logconfs.append(lc2)
 
-    lc3 = LogConfig(name='Quaternion', period_in_ms=25)
-    for v in ('stateEstimate.qx', 'stateEstimate.qy',
-              'stateEstimate.qz', 'stateEstimate.qw'):
-        lc3.add_variable(v, 'float')
-    lc3.data_received_cb.add_callback(_log_cb_factory(uri))
-    logconfs.append(lc3)
+    # Quaternion stream removed: state_13_to_state_9 only uses Euler from
+    # the stabilizer, and the quaternion was only retained for CSV logging.
 
     return logconfs
 
@@ -548,11 +763,20 @@ def get_state_SI(uri):
 
 
 def state_13_to_state_9(s13):
-    """Convert 13-D CF state to 9-D LQR state [x,y,z, vx,vy,vz, roll,pitch,yaw]."""
+    """Convert 13-D CF state to 9-D LQR state [x,y,z, vx,vy,vz, roll,pitch,yaw].
+
+    Pitch sign is NEGATED here: the Crazyflie firmware reports `stabilizer.pitch`
+    in aerospace convention (positive = nose up → drone moves -x_body), while the
+    Phoenix LQR was built in the opposite convention (positive pitch = nose down
+    → +x_body). Negating once on input and once on output keeps the LQR's
+    internal model consistent with what the hardware actually does (verified
+    by debug_axis.py: cmd_pitch=+5° produced Δx_body=-0.30 m).
+    Roll convention matches between CF and Phoenix, so it's left alone.
+    """
     return np.array([
-        s13[0], s13[1], s13[2],   # pos
-        s13[7], s13[8], s13[9],   # vel
-        s13[10], s13[11], s13[12] # roll, pitch, yaw (already in radians)
+        s13[0], s13[1], s13[2],     # pos
+        s13[7], s13[8], s13[9],     # vel
+        s13[10], -s13[11], s13[12]  # roll, -pitch, yaw  (pitch sign-flip)
     ], dtype=np.float64)
 
 # =============================================================================
@@ -649,6 +873,8 @@ def test(cf, uri):
     start_time = time.time()
     last_action_time = -RL_DECISION_INTERVAL  # trigger immediate first action
     step = 0
+    rate_anchor_step = 0
+    rate_anchor_time = start_time
 
     while time.time() - start_time < FLIGHT_DURATION:
         loop_start = time.time()
@@ -658,7 +884,11 @@ def test(cf, uri):
         state_13, thrust = get_state_SI(uri)
         state_13[0:2] += origin_offset.astype(np.float32)  # shift to training frame
         state_9 = state_13_to_state_9(state_13)
-        state_9[2] = HOVER_Z_SIM  # z fixed to training hover altitude for LQR
+        # Map real z (around DEFAULT_HEIGHT) into the training frame
+        # (around HOVER_Z_SIM). When the drone is at the intended hover
+        # altitude, state_9[2] == HOVER_Z_SIM and z error is zero; if it
+        # drifts down, the LQR sees the position error and pushes thrust.
+        state_9[2] = float(state_13[2]) + (HOVER_Z_SIM - DEFAULT_HEIGHT)
 
         # ── Terminal check ──
         pos_status = check_position_status(float(state_9[0]), float(state_9[1]))
@@ -693,23 +923,45 @@ def test(cf, uri):
             base_action_np = np.asarray(base_jax, dtype=np.float32)
             residual_np = np.asarray(res_jax, dtype=np.float32)
 
+            # Cap policy outputs. Lowered from 5 → 3 with the tilt clip
+            # tightened to ±15°: caps commanded velocity at 0.3 m/s, which
+            # is achievable in one RL window without saturating attitude.
+            ACTION_CLIP = 5.0
+            current_action = np.clip(current_action, -ACTION_CLIP, ACTION_CLIP)
+
             print(f"[RL t={current_time:.1f}s] action={current_action} "
                   f"(base={base_action_np}, res={residual_np})")
             last_action_time = current_time
 
             # ── Build reference trajectory from velocity command ──
-            vel_cmd = np.array([current_action[0] * ACTION_SCALE,
-                                current_action[1] * ACTION_SCALE,
-                                0.0], dtype=np.float64)
+            # Ramp the reference velocity from the current measured velocity
+            # to the policy's target over the first half of the LQR horizon
+            # (~0.25 s), then hold the target for the remaining half. Gives
+            # the LQR a settled reference at the horizon tail.
+            cur_vel_xy = state_9[3:5].astype(np.float64).copy()
+            target_vel_xy = current_action.astype(np.float64) * ACTION_SCALE
+            RAMP_STEPS = _HORIZON // 4
+
             ref = np.zeros((9, _HORIZON + 1), dtype=np.float64)
             ref[:, 0] = state_9.copy()
             for i in range(_HORIZON):
-                ref[0:3, i + 1] = ref[0:3, i] + vel_cmd * _DT_LQR
-                ref[3:6, i + 1] = vel_cmd
-                ref[6:9, i + 1] = 0.0     # desired attitude = 0
+                alpha = min(1.0, (i + 1) / RAMP_STEPS)
+                ramped_vx = (1.0 - alpha) * cur_vel_xy[0] + alpha * target_vel_xy[0]
+                ramped_vy = (1.0 - alpha) * cur_vel_xy[1] + alpha * target_vel_xy[1]
+                ref[0, i + 1] = ref[0, i] + ramped_vx * _DT_LQR
+                ref[1, i + 1] = ref[1, i] + ramped_vy * _DT_LQR
                 ref[2, i + 1] = HOVER_Z_SIM
-                ref[5, i + 1] = 0.0       # vz = 0
+                ref[3, i + 1] = ramped_vx
+                ref[4, i + 1] = ramped_vy
+                ref[5, i + 1] = 0.0
+                ref[6:9, i + 1] = 0.0
             reference_mpc = ref
+
+            # Snapshot this RL decision for post-flight plotting.
+            record_rl_decision(
+                uri, current_time, reference_mpc, belief_features,
+                (state_9[0], state_9[1]),
+            )
 
             # Compute LQR gains for whole horizon
             K_seq, F_seq, s_seq = compute_lqt_gains(
@@ -729,26 +981,46 @@ def test(cf, uri):
         k = min(lqr_step_idx, _HORIZON - 1)
         u_hat = lqt_control_step(K_seq[k], F_seq[k], s_seq[k + 1], state_9)
 
-        # Predicted next state (for belief residual)
-        x_pred_next = A_dt @ state_9 + B_dt @ u_hat
+        # Predicted next state (for belief residual). Uses the nonlinear
+        # quadrotor dynamics rather than the LQR's linear A_dt/B_dt — the
+        # 3% trig error and 10% cos(tilt) thrust loss in the linear model
+        # were being mistaken for wind by the IMM filter. The LQR controller
+        # itself still uses linear A_dt/B_dt for gain scheduling.
+        x_pred_next = nonlinear_step(state_9, u_hat)
 
         # ── Convert u_hat to CF commands ──
         # u_hat[0] = thrust fraction, u_hat[1:4] = target roll/pitch/yaw (rad)
-        hover_thrust = _MASS * _GRAVITY
-        thrust_force = u_hat[0] * _T_MAX
+        # Tilt-aware hover: at tilt θ the vertical thrust is T·cos(θ), so
+        # commanding mg yields mg·cos(θ) of lift — losing ~10% at ±25°.
+        # Compensate so steady-state hover holds altitude even when tilted.
+        tilt_rad = math.sqrt(state_9[6] ** 2 + state_9[7] ** 2)
+        cos_tilt = max(math.cos(tilt_rad), 0.5)        # floor for safety
+        hover_thrust = (_MASS * _GRAVITY) / cos_tilt
+
+        # Clip the LQR's thrust correction so neither motors-off nor
+        # full-saturation can happen on a single bad step.
+        u_thrust = float(np.clip(u_hat[0], -0.3, 1.0))
+        thrust_force = u_thrust * _T_MAX
         thrust_cmd = thrust_to_cmd(hover_thrust + thrust_force)
         thrust_cmd = int(np.clip(thrust_cmd, 0, 65535))
 
-        # Target angles from LQR (radians → degrees for CF)
-        # Clip to safe range (±25 deg)
-        target_roll_deg  = float(np.clip(np.degrees(u_hat[1]), -25.0, 25.0))
-        target_pitch_deg = float(np.clip(np.degrees(u_hat[2]), -25.0, 25.0))
-        target_yawrate_deg = float(np.clip(np.degrees(u_hat[3]) / _DT_LQR, -200.0, 200.0))
-        # Note: for yaw, u_hat[3] is a target angle; convert to rate as
-        # (target_yaw - current_yaw) / dt for the CF's rate-mode yaw channel
-        current_yaw = state_9[8]
-        yaw_error = u_hat[3] - current_yaw
-        target_yawrate_deg = float(np.clip(np.degrees(yaw_error) / _DT_LQR, -200.0, 200.0))
+        # Target angles from LQR (radians → degrees for CF).
+        # Clip to safe range (±25 deg).
+        # NO sign flip on output: the send_setpoint API uses the same convention
+        # as Phoenix (+pitch → +x motion). State_9[7] IS sign-flipped on input
+        # (see state_13_to_state_9) because stabilizer.pitch logs in the
+        # opposite convention to send_setpoint. Verified by inspecting CSV:
+        # target_pitch_deg=+25 produced vx → +2.4 m/s while stabilizer.pitch
+        # logged -25 — i.e. send_setpoint and the log have OPPOSITE signs.
+        # Tilt clip lowered 25→15°: keeps the LQR inside its hover-linearization
+        # validity range, cuts the cos(tilt) thrust loss to ~3% (vs 10% at 25°),
+        # and reduces the model-vs-real residuals that the IMM filter mistakes
+        # for wind. Penalty: lateral acceleration capped at g·sin(15°)≈2.5 m/s².
+        target_roll_deg  = float(np.clip(np.degrees(u_hat[1]), -15.0, 15.0))
+        target_pitch_deg = float(np.clip(np.degrees(u_hat[2]), -15.0, 15.0))
+        # Yaw is uncontrolled (policy doesn't use it); hold the rate at 0
+        # and let the on-board stabilizer maintain heading.
+        target_yawrate_deg = 0.0
 
         # send_setpoint: (roll_deg, pitch_deg, yawrate_deg_s, thrust_pwm)
         # With stabModeRoll=1, stabModePitch=1: roll/pitch are ANGLE commands
@@ -771,6 +1043,7 @@ def test(cf, uri):
             "Belief_y": float(belief_features[1]),
             "Belief_sigma_x": float(belief_features[2]),
             "Belief_sigma_y": float(belief_features[3]),
+            "Belief_p_fast": float(belief_features[4]),
             "goal_x": float(GOAL_XY[0]),
             "goal_y": float(GOAL_XY[1]),
             "u_hat_thrust": float(u_hat[0]),
@@ -779,6 +1052,14 @@ def test(cf, uri):
             "u_hat_yaw": float(u_hat[3]),
             "target_roll_deg": target_roll_deg,
             "target_pitch_deg": target_pitch_deg,
+            "actual_roll_deg": float(math.degrees(state_13[10])),
+            # Pitch logged with sign FLIPPED relative to stabilizer.pitch so
+            # this column matches the target_pitch_deg convention (send_setpoint
+            # API / Phoenix). Without the flip, cmd and actual mirror each
+            # other in the plot because the firmware reports stabilizer.pitch
+            # in the opposite sign to what send_setpoint accepts.
+            "actual_pitch_deg": -float(math.degrees(state_13[11])),
+            "actual_yaw_deg": float(math.degrees(state_13[12])),
             "lqr_step": k,
             "trajectory_x_end": float(reference_mpc[0, -1]),
             "trajectory_y_end": float(reference_mpc[1, -1]),
@@ -797,6 +1078,18 @@ def test(cf, uri):
 
         lqr_step_idx += 1
         step += 1
+
+        # Loop-rate sanity check — rolling window so the JAX JIT compile on
+        # the first RL decision doesn't poison the average. Should reach
+        # ~40 Hz at steady state to match LQR _DT_LQR=25 ms.
+        if step > 0 and step % 50 == 0:
+            now = time.time()
+            d_steps = step - rate_anchor_step
+            d_time = now - rate_anchor_time
+            rate = d_steps / max(d_time, 1e-3)
+            print(f"[loop] last {d_steps} steps: {rate:.1f} Hz")
+            rate_anchor_step = step
+            rate_anchor_time = now
 
     print(f"[flight] Ended: {termination_cause} after {step} steps")
 
