@@ -57,18 +57,23 @@ from model.belief import (
 # Config — loaded from the checkpoint's config.json
 # =============================================================================
 # Switch which trained model gets loaded. Each architecture differs:
-#   M0 — base (8-D obs, scratch) + residual + gate, MU/SIGMA scaled
-#   M1 — base only, no belief, no residual         (13-D obs+zeros)
-#   M2 — base (13-D obs+zeros) + residual + gate, MU/SIGMA scaled (frozen base)
-#   M5 — base only, belief CONCAT into obs        (13-D obs+belief)
-MODEL_TAG = "M5"   # one of: "M0", "M1", "M2", "M5"
+#   M0        — base (8-D obs, scratch) + residual + gate, MU/SIGMA scaled
+#   M1        — base only, no belief, no residual          (13-D obs+zeros)
+#   M2        — base (13-D obs+zeros) + residual + gate, MU/SIGMA scaled (frozen base)
+#   M5        — base only, belief CONCAT into obs          (13-D obs+belief)
+#   M1_term   — like M1, retrained with terminal-V^h reward (seed 4)
+#   M0nl_term — like M0, retrained with terminal-V^h + nonlinear predictor (seed 4)
+MODEL_TAG = "M0nl_term"   # one of: "M0", "M1", "M2", "M5", "M1_term", "M0nl_term"
+# MODEL_TAG = "M1_term"   # one of: "M0", "M1", "M2", "M5", "M1_term", "M0nl_term"
 
 _MODELS_ROOT = "/home/realm/jaeyoun/crazyflie-lib-python/models"
 MODEL_DIRS = {
-    "M0": f"{_MODELS_ROOT}/trained_20260430_002921_s0_M0_res_track_rew_scratch_PhoenixPhysicalJAX_DCBF_belief_residual_seed0",
-    "M1": f"{_MODELS_ROOT}/trained_20260430_003922_s0_M1_nobelief_PhoenixPhysicalJAX_DCBF_nobelief_seed0",
-    "M2": f"{_MODELS_ROOT}/trained_s0_M2_res_track_rew_frz_20260428_143340_PhoenixPhysicalJAX_DCBF_belief_residual_seed0",
-    "M5": f"{_MODELS_ROOT}/trained_20260430_013140_s0_M5_concat_PhoenixPhysicalJAX_DCBF_belief_seed0",
+    "M0":        f"{_MODELS_ROOT}/trained_20260430_002921_s0_M0_res_track_rew_scratch_PhoenixPhysicalJAX_DCBF_belief_residual_seed0",
+    "M1":        f"{_MODELS_ROOT}/trained_20260430_003922_s0_M1_nobelief_PhoenixPhysicalJAX_DCBF_nobelief_seed0",
+    "M2":        f"{_MODELS_ROOT}/trained_s0_M2_res_track_rew_frz_20260428_143340_PhoenixPhysicalJAX_DCBF_belief_residual_seed0",
+    "M5":        f"{_MODELS_ROOT}/trained_20260430_013140_s0_M5_concat_PhoenixPhysicalJAX_DCBF_belief_seed0",
+    "M1_term":   f"{_MODELS_ROOT}/trained_20260504_191611_s4_M1_term_nobelief_PhoenixPhysicalJAX_DCBF_nobelief_termVh_seed4",
+    "M0nl_term": f"{_MODELS_ROOT}/trained_20260504_191611_s4_M0nl_term_res_track_rew_scratch_nlpred_PhoenixPhysicalJAX_DCBF_belief_residual_termVh_seed4",
 }
 MODEL_DIR       = MODEL_DIRS[MODEL_TAG]
 CHECKPOINT_PATH = os.path.join(MODEL_DIR, "best_checkpoint.pkl")
@@ -86,7 +91,8 @@ SENSING_RADIUS = float(_cfg.get("SENSING_RADIUS", 0.5))
 BELIEF_MODE    = _cfg.get("BELIEF_MODE", "residual")  # 'residual', 'concat', 'none'
 USE_RESIDUAL   = bool(_cfg.get("USE_RESIDUAL", True))
 BELIEF_DIM     = 5
-
+ACTION_SCALE =0.08 
+RESIDUAL_SCALE= 0.25 # 0.5
 print(f"[config] MODEL_TAG={MODEL_TAG}, BELIEF_MODE={BELIEF_MODE}, "
       f"USE_RESIDUAL={USE_RESIDUAL}, MU_SCALE={MU_SCALE}, SIGMA_SCALE={SIGMA_SCALE}")
 
@@ -186,6 +192,27 @@ def _build_lqr_system():
 A_dt, B_dt, Q_lqr, R_lqr = _build_lqr_system()
 
 
+# ── u_hat[0] saturation bounds ──────────────────────────────────────────────
+# Mirror BRACE training (phoenix_physical_jax.py:_compute_u_hat0_bounds).
+# The on-board attitude cascade clamps each motor's PWM to [35000, 55000],
+# i.e. physical per-motor thrust ∈ [0.251 N, 0.487 N] (≈ 0.95 mg .. 1.84 mg).
+# In u_hat[0] units (= (T_total − m·g) / (m·g·THRUST2WEIGHT_RATIO)):
+#   _U_HAT0_MIN ≈ -0.023,  _U_HAT0_MAX ≈ +0.373
+# Without this clip the nonlinear predictor lets T_total go negative when
+# the LQR over-brakes a climb, which flips ax/ay sign and corrupts the IMM
+# residual — exactly the bug the BRACE commit (9573b20) calls out.
+def _compute_u_hat0_bounds():
+    a2 = 2.130295e-11; a1 = 1.032633e-6; a0 = 5.484560e-4
+    def _pwm_to_T(cmd):
+        return 4.0 * (a0 + a2 * cmd * cmd + a1 * cmd)
+    T_min, T_max_real = _pwm_to_T(35000.0), _pwm_to_T(55000.0)
+    T_max_lqr = _MASS * _GRAVITY * 2.25       # THRUST2WEIGHT_RATIO
+    return ((T_min - _MASS * _GRAVITY) / T_max_lqr,
+            (T_max_real - _MASS * _GRAVITY) / T_max_lqr)
+
+_U_HAT0_MIN, _U_HAT0_MAX = _compute_u_hat0_bounds()
+
+
 def nonlinear_step(state_9, u_hat, dt=_DT_LQR, n_substeps=4):
     """Closed-form nonlinear forward integration of one LQR-step's dynamics.
 
@@ -212,7 +239,18 @@ def nonlinear_step(state_9, u_hat, dt=_DT_LQR, n_substeps=4):
     target_rpy = np.asarray(u_hat[1:4], dtype=np.float64)
     inv_tau = 1.0 / _TAU_ATT
     drag_per_m = _DRAG / _MASS
-    T_total = _MASS * _GRAVITY + float(u_hat[0]) * _T_MAX   # total thrust (N)
+    # Clip u_hat[0] to the SAME range the controller uses ([-0.3, +1.0]),
+    # not BRACE's tighter [-0.023, +0.373] PWM-cascade bound. Reason: the
+    # CF firmware accepts send_setpoint with PWM all the way down to 0
+    # (verified by past flight data: thrust_pwm range was [0, 65535]),
+    # so real motors DO go below the PWM 35000 floor that BRACE's
+    # attitude_cascade enforced in simulation. Using a tighter clip here
+    # would make the predictor under-predict descent and bias the IMM
+    # residual. This clip's only job is to prevent T_total < 0 (which
+    # would flip ax/ay sign): with [-0.3, +1.0], T_total ∈ [0.086, 0.86] N
+    # — always positive.
+    u0 = float(np.clip(u_hat[0], -0.3, 1.0))
+    T_total = _MASS * _GRAVITY + u0 * _T_MAX
     T_over_m = T_total / _MASS
     for _ in range(n_substeps):
         roll, pitch = s[6], s[7]
@@ -421,12 +459,12 @@ _policy_forward_jit = jax.jit(policy_forward, static_argnums=())
 URIS = [
     'radio://0/80/2M/E7E7E7E710',
 ]
-DEFAULT_HEIGHT = 0.35       # m — hover altitude for real CF
+DEFAULT_HEIGHT = 0.5       # m — hover altitude for real CF
 HOVER_Z_SIM    = 1.0        # m — hover altitude used during training
 RL_DECISION_INTERVAL = 0.5  # s — matches training
 MPC_PLANNING_INTERVAL = _DT_LQR  # 0.025 s
 
-FLIGHT_DURATION = 30.0      # s — total flight time
+FLIGHT_DURATION = 40.0      # s — total flight time
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -533,6 +571,11 @@ def save_measurements_to_disk():
     for uri, rows in _measurements.items():
         if not rows:
             continue
+        # Snapshot — under Ctrl-C the test() thread can still be appending to
+        # _measurements[uri]; without the local copy, list comprehensions
+        # later in this block see an array length 1 longer than `flight_times`.
+        with _meas_lock:
+            rows = list(rows)
         xs = np.array([r["x"] for r in rows])
         ys = np.array([r["y"] for r in rows])
         flight_times = np.array([r.get("flight_time", i * 0.025) for i, r in enumerate(rows)])
@@ -740,7 +783,7 @@ def get_state_SI(uri):
     plus scalar thrust."""
     s = fullstate.get(uri, {})
     x  = float(s.get('stateEstimateZ.x', 0)) * 1e-3
-    y  = float(s.get('stateEstimateZ.y', 0)) * 1e-3
+    y  = float(s.get('stateEstimateZ.y', 3)) * 1e-3
     z  = float(s.get('stateEstimateZ.z', 0)) * 1e-3
     vx = float(s.get('stateEstimateZ.vx', 0)) * 1e-3
     vy = float(s.get('stateEstimateZ.vy', 0)) * 1e-3
@@ -845,6 +888,27 @@ def test(cf, uri):
     imm_state = init_imm_state()
     belief_features = np.zeros(BELIEF_DIM, dtype=np.float32)
 
+    # ── Pre-warm ALL JAX-jitted functions before takeoff ──
+    # Without this, the first call to each jit'd function compiles for
+    # ~0.5–1 s, blocking the LQR loop and dropping the drone. We hit this
+    # with policy_forward_jit on the first RL tick AND with imm_predict /
+    # imm_update on the second RL tick (verified by 0.79 s LQR blackout
+    # in 20260504_230828; drone fell from z=0.50 to z=0.01 during the
+    # gap). Compile everything here so the in-flight loop is steady-state.
+    print("[warmup] pre-compiling JAX functions (≈1 s)…")
+    _t0_warm = time.time()
+    _dummy_obs = jnp.zeros(8, dtype=jnp.float32)
+    _dummy_belief = jnp.zeros(BELIEF_DIM, dtype=jnp.float32)
+    _ = _policy_forward_jit(policy_params, _dummy_obs, _dummy_belief)
+    _warm_state = imm_predict(imm_state, imm_cfg)
+    _warm_state = imm_update(_warm_state, jnp.zeros(2, dtype=jnp.float32), imm_cfg)
+    _warm_feat = imm_get_features(_warm_state)
+    # Block until all JAX dispatches finish (compile is async on the device).
+    jax.block_until_ready(_warm_state.mu_models)
+    jax.block_until_ready(_warm_state.model_probs)
+    jax.block_until_ready(_warm_feat)
+    print(f"[warmup] done in {time.time() - _t0_warm:.2f} s")
+
     # ── Take off with high-level commander ──
     cf.commander.send_setpoint(0, 0, 0, 0)  # unlock
     time.sleep(0.1)
@@ -868,6 +932,7 @@ def test(cf, uri):
     reference_mpc = None
     lqr_step_idx = 0
     residual_xy_acc = np.zeros(2, dtype=np.float64)
+    rl_decision_count = 0    # used to skip the JIT-poisoned first RL window
     termination_cause = "timeout"
 
     start_time = time.time()
@@ -900,12 +965,20 @@ def test(cf, uri):
 
         # ── RL decision (every 0.5 s) ──
         if current_time - last_action_time >= RL_DECISION_INTERVAL - 0.02:
-            # Update belief with accumulated residual
-            if np.all(np.isfinite(residual_xy_acc)):
+            # SKIP belief update for the FIRST RL window. The first call to
+            # _policy_forward_jit triggers JAX JIT compile (~0.5–1 s wall
+            # clock), during which the LQR loop sleeps for 0 ms but real
+            # time still elapses. The first window's residual_xy_acc thus
+            # compares ~800 ms of real motion against ~25 ms of predicted
+            # motion → garbage residual that swings the IMM into a phantom
+            # wind direction (verified in 20260504_230324: μ_x jumped to
+            # -0.061 on the first update with no actual disturbance).
+            if rl_decision_count > 0 and np.all(np.isfinite(residual_xy_acc)):
                 imm_state = imm_predict(imm_state, imm_cfg)
-                imm_state = imm_update(imm_state, jnp.array(residual_xy_acc), imm_cfg)
+                imm_state = imm_update(imm_state, jnp.array(residual_xy_acc*RESIDUAL_SCALE), imm_cfg)
                 belief_features = np.asarray(imm_get_features(imm_state), dtype=np.float32)
             residual_xy_acc[:] = 0.0
+            rl_decision_count += 1
 
             # Build observation
             obs_8d = build_obs_simple_states(
@@ -926,7 +999,7 @@ def test(cf, uri):
             # Cap policy outputs. Lowered from 5 → 3 with the tilt clip
             # tightened to ±15°: caps commanded velocity at 0.3 m/s, which
             # is achievable in one RL window without saturating attitude.
-            ACTION_CLIP = 5.0
+            ACTION_CLIP = 15.0
             current_action = np.clip(current_action, -ACTION_CLIP, ACTION_CLIP)
 
             print(f"[RL t={current_time:.1f}s] action={current_action} "
@@ -945,7 +1018,8 @@ def test(cf, uri):
             ref = np.zeros((9, _HORIZON + 1), dtype=np.float64)
             ref[:, 0] = state_9.copy()
             for i in range(_HORIZON):
-                alpha = min(1.0, (i + 1) / RAMP_STEPS)
+                # alpha = min(1.0, (i + 1) / RAMP_STEPS)
+                alpha =1.0
                 ramped_vx = (1.0 - alpha) * cur_vel_xy[0] + alpha * target_vel_xy[0]
                 ramped_vy = (1.0 - alpha) * cur_vel_xy[1] + alpha * target_vel_xy[1]
                 ref[0, i + 1] = ref[0, i] + ramped_vx * _DT_LQR
@@ -997,8 +1071,15 @@ def test(cf, uri):
         cos_tilt = max(math.cos(tilt_rad), 0.5)        # floor for safety
         hover_thrust = (_MASS * _GRAVITY) / cos_tilt
 
-        # Clip the LQR's thrust correction so neither motors-off nor
-        # full-saturation can happen on a single bad step.
+        # u_hat[0] clip [-0.3, +1.0] — same range used by the nonlinear
+        # predictor. Floor of -0.3 keeps T_total > 0 (prevents predictor
+        # ax/ay sign flip BRACE warned about) while still giving the LQR
+        # enough descent authority (~6.6 m/s² max downward accel). This
+        # is INTENTIONALLY looser than BRACE's [-0.023, +0.373]: that
+        # bound mirrors Phoenix-sim's attitude_cascade PWM clamp at
+        # 35000–55000, but real CF via send_setpoint accepts PWM 0..65535
+        # without on-board clamping (verified by past CSV: thrust_pwm
+        # range was [0, 65535]).
         u_thrust = float(np.clip(u_hat[0], -0.3, 1.0))
         thrust_force = u_thrust * _T_MAX
         thrust_cmd = thrust_to_cmd(hover_thrust + thrust_force)
